@@ -1,4 +1,3 @@
-import { query, tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Lead } from "@/lib/types";
 
@@ -18,76 +17,122 @@ const linkedinContentSchema = z.object({
   type: z.literal("linkedin"),
   message: z.string(),
 });
+const contentSchema = z.discriminatedUnion("type", [emailContentSchema, linkedinContentSchema]);
+
+// Inlined from the outbound-copywriting skill's Copy Rules -- kept in sync
+// manually since this deliberately doesn't load the skill (see below).
+const SYSTEM_PROMPT =
+  "You are Koya Talent's outbound copywriter, revising ONE piece of outreach for a single already-qualified " +
+  "lead. This is a draft for human review -- it is never sent automatically, there is no send capability " +
+  "anywhere in this system.\n\n" +
+  "Copy rules:\n" +
+  "- Use only company context actually gathered during research (fit reasons, concerns, source summary) -- no invented facts.\n" +
+  "- Keep each email short and direct; write like a person, not a promotion.\n" +
+  '- Avoid fake urgency, exaggerated claims, and generic praise ("Loved what you\'re building", "Your company looks impressive").\n' +
+  "- Good personalization references evidence: positioning, audience served, a hiring/scaling signal, a public workflow clue.\n" +
+  "- Do not include personal email addresses.\n" +
+  "- Every claim must be traceable back to the evidence given.";
+
+const REGEN_TOOL = {
+  name: "submit_regenerated_content",
+  description: "Submit the regenerated outreach content for this one piece.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      type: { type: "string", enum: ["email", "linkedin"] },
+      subject: { type: "string" },
+      body: { type: "string" },
+      personalization_note: { type: "string" },
+      message: { type: "string" },
+    },
+    required: ["type"],
+  },
+};
 
 /**
- * Regenerates exactly one outreach piece for an already-qualified lead,
- * using only that lead's stored evidence plus an optional human tweak
- * instruction. This is a narrow, single-purpose agent call -- no discovery,
- * no scraping, no Apify -- reusing the outbound-copywriting skill on disk
- * the same way the main pipeline does. Returns the draft without persisting
- * it; the caller decides whether to keep or discard it.
+ * Regenerates exactly one outreach piece for an already-qualified lead, using
+ * only that lead's stored evidence plus an optional human tweak instruction.
+ * Returns the draft without persisting it; the caller decides whether to
+ * keep or discard it.
+ *
+ * Deliberately a direct Anthropic Messages API call, not a Claude Agent SDK
+ * `query()` (as this used to be). Real evidence: the SDK route (skills:"all",
+ * a Skill-tool round trip, an MCP server) once took a person 4 minutes with
+ * no timeout to bound it -- that harness's subprocess/MCP-server startup
+ * overhead is a fixed cost per call, and for a single-shot rewrite task with
+ * no multi-turn tool use, it dwarfs the actual model latency. Kept on the
+ * full-strength default model (unlike the ICP-inference call, which uses
+ * Haiku) because copywriting quality genuinely matters here, unlike narrow
+ * structured extraction -- the fix is removing unnecessary architecture, not
+ * lowering output quality.
  */
 export async function regenerateOutreachPiece(
   lead: Lead,
   target: RegenerateTarget,
   instruction: string | undefined
 ): Promise<RegeneratedContent> {
-  let captured: RegeneratedContent | null = null;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY must be set (see .env.local.example).");
 
-  const submitTool = tool(
-    "submit_regenerated_content",
-    "Submit the regenerated outreach content for this one piece. Call exactly once.",
-    { content: z.discriminatedUnion("type", [emailContentSchema, linkedinContentSchema]) },
-    async (args) => {
-      captured = args.content;
-      return { content: [{ type: "text", text: "Received." }] };
-    },
-    { annotations: { readOnlyHint: false, destructiveHint: false } }
-  );
-
-  const server = createSdkMcpServer({ name: "regen", version: "1.0.0", tools: [submitTool] });
-
-  const systemPrompt = `You are Koya Talent's outbound copywriter, revising ONE piece of outreach for a single already-qualified lead. Follow the outbound-copywriting skill's rules exactly: use only the evidence below, no invented facts, no fake urgency or exaggerated claims, no generic praise, calm and credible tone, every claim traceable to the evidence. This is a draft for human review -- it is never sent automatically, there is no send capability anywhere in this system.
-
-Evidence for this lead (the only facts you may reference):
-Company: ${lead.company_name} (${lead.company_domain})
-Fit reasons: ${lead.fit_reasons.join("; ") || "none recorded"}
-Concerns: ${lead.concerns.join("; ") || "none recorded"}
-Source summary: ${lead.source_summary || "none recorded"}`;
+  const evidence =
+    `Company: ${lead.company_name} (${lead.company_domain})\n` +
+    `Fit reasons: ${lead.fit_reasons.join("; ") || "none recorded"}\n` +
+    `Concerns: ${lead.concerns.join("; ") || "none recorded"}\n` +
+    `Source summary: ${lead.source_summary || "none recorded"}`;
 
   const targetDescription =
     target.type === "email"
-      ? `Regenerate email ${target.step} of the 3-step cold email sequence (subject, body, and personalization_note).`
-      : "Regenerate the short LinkedIn message.";
+      ? `Regenerate email ${target.step} of the 3-step cold email sequence -- return type "email" plus subject, body, and personalization_note.`
+      : 'Regenerate the short LinkedIn message -- return type "linkedin" plus message.';
 
-  const shape =
-    target.type === "email"
-      ? `{"type":"email","subject":"...","body":"...","personalization_note":"..."}`
-      : `{"type":"linkedin","message":"..."}`;
+  const userContent =
+    `${evidence}\n\n${targetDescription}` +
+    (instruction
+      ? `\n\nApply this tweak instruction from the reviewer while still following every copy rule: "${instruction}"`
+      : "") +
+    "\n\nCall submit_regenerated_content exactly once.";
 
-  const prompt = `${targetDescription}${
-    instruction ? `\n\nApply this tweak instruction from the reviewer while still following every copy rule above: "${instruction}"` : ""
-  }\n\nUse the outbound-copywriting skill, then call submit_regenerated_content exactly once with this shape: ${shape}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
 
-  for await (const message of query({
-    prompt,
-    options: {
-      systemPrompt,
-      cwd: process.cwd(),
-      settingSources: ["project"],
-      skills: "all",
-      tools: ["Skill"],
-      allowedTools: ["mcp__regen__submit_regenerated_content", "Skill"],
-      mcpServers: { regen: server },
-      maxTurns: 8,
-      permissionMode: "bypassPermissions",
-    },
-  })) {
-    if (message.type === "result" && message.subtype !== "success") {
-      throw new Error(`Regeneration agent ended with subtype "${message.subtype}".`);
+  let response: Response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-5",
+        max_tokens: 1024,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userContent }],
+        tools: [REGEN_TOOL],
+        tool_choice: { type: "tool", name: "submit_regenerated_content" },
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new Error("Regeneration took too long (20s) and was aborted. Try again.");
     }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
   }
 
-  if (!captured) throw new Error("Agent did not submit regenerated content.");
-  return captured;
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Anthropic API error (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  const toolUse = (data.content ?? []).find(
+    (block: { type: string; name?: string }) => block.type === "tool_use" && block.name === "submit_regenerated_content"
+  );
+  if (!toolUse) throw new Error("Model did not call submit_regenerated_content.");
+
+  return contentSchema.parse(toolUse.input);
 }

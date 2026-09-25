@@ -152,6 +152,14 @@ export function RunLiveView({
                 <span aria-hidden>&#8681;</span> Export all {family.length} attempts
               </a>
             )}
+            {toolCalls.length > 0 && (
+              <a
+                href={`/api/runs/${runId}/export?type=tool_calls`}
+                className="flex items-center gap-1.5 rounded-full border border-panel-border px-3 py-1.5 text-xs font-medium text-neutral-300 transition hover:border-accent/40 hover:text-accent"
+              >
+                <span aria-hidden>&#8681;</span> Export tool calls
+              </a>
+            )}
             {!isActive && (
               <button
                 onClick={handleRetry}

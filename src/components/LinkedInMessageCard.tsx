@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Lead } from "@/lib/types";
+import { clearPendingRegen, getPendingRegen, regenKey, setPendingRegen } from "@/lib/pendingRegenerations";
 
 export function LinkedInMessageCard({
   leadId,
@@ -14,15 +15,35 @@ export function LinkedInMessageCard({
   editedAt: string | null;
   onLeadUpdated: (lead: Lead) => void;
 }) {
+  const key = regenKey(leadId, "linkedin");
+  const pending = getPendingRegen(key);
+
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message);
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [regenOpen, setRegenOpen] = useState(false);
   const [instruction, setInstruction] = useState("");
-  const [regenerating, setRegenerating] = useState(false);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(pending?.status === "pending");
+  const [preview, setPreview] = useState<string | null>(pending?.status === "done" ? pending.result.message : null);
+  const [error, setError] = useState<string | null>(pending?.status === "error" ? pending.message : null);
+
+  // Picks up a regeneration that was already running before this component
+  // mounted (e.g. the user switched tabs mid-generation and came back).
+  useEffect(() => {
+    if (!regenerating) return;
+    const interval = setInterval(() => {
+      const current = getPendingRegen(key);
+      if (current?.status === "done") {
+        setPreview(current.result.message);
+        setRegenerating(false);
+      } else if (current?.status === "error") {
+        setError(current.message);
+        setRegenerating(false);
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [regenerating, key]);
 
   function startEdit() {
     setDraft(message);
@@ -44,6 +65,7 @@ export function LinkedInMessageCard({
       onLeadUpdated(lead);
       setEditing(false);
       setPreview(null);
+      clearPendingRegen(key);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -60,6 +82,7 @@ export function LinkedInMessageCard({
   async function regenerate() {
     setRegenerating(true);
     setError(null);
+    setPendingRegen(key, { status: "pending" });
     try {
       const res = await fetch(`/api/leads/${leadId}/regenerate-outreach`, {
         method: "POST",
@@ -68,11 +91,14 @@ export function LinkedInMessageCard({
       });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "Regeneration failed");
       const { draft: result } = await res.json();
+      setPendingRegen(key, { status: "done", result: { message: result.message } });
       setPreview(result.message);
       setRegenOpen(false);
       setInstruction("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setPendingRegen(key, { status: "error", message });
+      setError(message);
     } finally {
       setRegenerating(false);
     }
@@ -159,7 +185,13 @@ export function LinkedInMessageCard({
           <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-300">Regenerated preview -- not saved yet</p>
           <p className="mt-2 max-w-prose whitespace-pre-wrap text-sm leading-relaxed text-neutral-300">{preview}</p>
           <div className="mt-3 flex justify-end gap-2">
-            <button onClick={() => setPreview(null)} className="rounded-full px-4 py-1.5 text-sm font-medium text-neutral-400 hover:text-neutral-100">
+            <button
+              onClick={() => {
+                setPreview(null);
+                clearPendingRegen(key);
+              }}
+              className="rounded-full px-4 py-1.5 text-sm font-medium text-neutral-400 hover:text-neutral-100"
+            >
               Discard
             </button>
             <button

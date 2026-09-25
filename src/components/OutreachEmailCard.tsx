@@ -1,9 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Lead, OutreachEmailStep } from "@/lib/types";
+import { clearPendingRegen, getPendingRegen, regenKey, setPendingRegen } from "@/lib/pendingRegenerations";
 
 type Draft = { subject: string; body: string; personalization_note: string };
+
+function toEmailField(step: number): "email_1" | "email_2" | "email_3" {
+  return `email_${step}` as "email_1" | "email_2" | "email_3";
+}
 
 export function OutreachEmailCard({
   leadId,
@@ -14,15 +19,39 @@ export function OutreachEmailCard({
   step: OutreachEmailStep;
   onLeadUpdated: (lead: Lead) => void;
 }) {
+  const key = regenKey(leadId, toEmailField(step.step));
+  const pending = getPendingRegen(key);
+
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Draft>(toDraft(step));
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [regenOpen, setRegenOpen] = useState(false);
   const [instruction, setInstruction] = useState("");
-  const [regenerating, setRegenerating] = useState(false);
-  const [preview, setPreview] = useState<Draft | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(pending?.status === "pending");
+  const [preview, setPreview] = useState<Draft | null>(
+    pending?.status === "done" ? (pending.result as unknown as Draft) : null
+  );
+  const [error, setError] = useState<string | null>(pending?.status === "error" ? pending.message : null);
+
+  // Picks up a regeneration that was already running before this component
+  // mounted (e.g. the user switched tabs mid-generation and came back) --
+  // the fetch itself keeps running regardless of mount state; this just
+  // polls the shared store for when it resolves.
+  useEffect(() => {
+    if (!regenerating) return;
+    const interval = setInterval(() => {
+      const current = getPendingRegen(key);
+      if (current?.status === "done") {
+        setPreview(current.result as unknown as Draft);
+        setRegenerating(false);
+      } else if (current?.status === "error") {
+        setError(current.message);
+        setRegenerating(false);
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [regenerating, key]);
 
   function startEdit() {
     setDraft(toDraft(step));
@@ -44,6 +73,7 @@ export function OutreachEmailCard({
       onLeadUpdated(lead);
       setEditing(false);
       setPreview(null);
+      clearPendingRegen(key);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -60,6 +90,7 @@ export function OutreachEmailCard({
   async function regenerate() {
     setRegenerating(true);
     setError(null);
+    setPendingRegen(key, { status: "pending" });
     try {
       const res = await fetch(`/api/leads/${leadId}/regenerate-outreach`, {
         method: "POST",
@@ -68,11 +99,15 @@ export function OutreachEmailCard({
       });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "Regeneration failed");
       const { draft: result } = await res.json();
-      setPreview({ subject: result.subject, body: result.body, personalization_note: result.personalization_note });
+      const resultDraft = { subject: result.subject, body: result.body, personalization_note: result.personalization_note };
+      setPendingRegen(key, { status: "done", result: resultDraft });
+      setPreview(resultDraft);
       setRegenOpen(false);
       setInstruction("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setPendingRegen(key, { status: "error", message });
+      setError(message);
     } finally {
       setRegenerating(false);
     }
@@ -180,7 +215,10 @@ export function OutreachEmailCard({
           <p className="mt-2 max-w-prose text-xs italic leading-relaxed text-neutral-500">{preview.personalization_note}</p>
           <div className="mt-3 flex justify-end gap-2">
             <button
-              onClick={() => setPreview(null)}
+              onClick={() => {
+                setPreview(null);
+                clearPendingRegen(key);
+              }}
               className="rounded-full px-4 py-1.5 text-sm font-medium text-neutral-400 hover:text-neutral-100"
             >
               Discard
